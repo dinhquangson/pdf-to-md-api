@@ -2,3 +2,4 @@ fastapi
 marker-pdf
 pydantic
 scalar_fastapi
+uvicorn
