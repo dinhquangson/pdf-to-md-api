@@ -141,9 +141,9 @@ async def convert_pdf(
 
         # Save images safely
         for img_name, img_data in images.items():
-            img_path = output_dir / f"{img_name}.png"
+            img_path = output_dir / f"{img_name}.jpeg"
             if isinstance(img_data, Image.Image):
-                img_data.save(img_path, format="PNG")
+                img_data.save(img_path, format="JPG")
             elif isinstance(img_data, (bytes, bytearray)):
                 with open(img_path, "wb") as img_file:
                     img_file.write(img_data)
