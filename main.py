@@ -1,7 +1,6 @@
 import base64
 import json
 import shutil
-import uuid
 from pathlib import Path
 from typing import Optional
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form
@@ -128,8 +127,8 @@ async def convert_pdf(
         text, metadata, images = text_from_rendered(rendered)
 
         # Create unique output folder
-        job_id = str(uuid.uuid4())
-        output_dir = Path("output") / job_id
+        zip_file_name = file.filename.removesuffix(".pdf")
+        output_dir = Path("output") / zip_file_name
         output_dir.mkdir(parents=True, exist_ok=True)
 
         # Save markdown or chosen format
@@ -155,13 +154,13 @@ async def convert_pdf(
                 raise TypeError(f"Unsupported image data type for {img_name}: {type(img_data)}")
 
         # Create ZIP
-        zip_path = Path("output") / f"{job_id}.zip"
+        zip_path = Path("output") / f"{zip_file_name}.zip"
         shutil.make_archive(str(zip_path.with_suffix("")), 'zip', output_dir)
 
         # Cleanup uploaded file
         file_path.unlink()
 
-        return FileResponse(zip_path, media_type="application/zip", filename=f"{job_id}.zip")
+        return FileResponse(zip_path, media_type="application/zip", filename=f"{zip_file_name}.zip")
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Internal Server Error: {str(e)}")
