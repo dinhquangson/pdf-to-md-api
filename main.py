@@ -140,8 +140,9 @@ async def convert_pdf(
         metadata_file = output_dir / "metadata.json"
         metadata_file.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
 
+        # Save images safely
         for img_name, img_data in images.items():
-            img_path = f"{img_name}.png"
+            img_path = output_dir / f"{img_name}.png"
             if isinstance(img_data, Image.Image):
                 img_data.save(img_path, format="PNG")
             elif isinstance(img_data, (bytes, bytearray)):
@@ -154,13 +155,13 @@ async def convert_pdf(
                 raise TypeError(f"Unsupported image data type for {img_name}: {type(img_data)}")
 
         # Create ZIP
-        zip_path = Path("output") / f"{file.filename}.zip"
+        zip_path = Path("output") / f"{job_id}.zip"
         shutil.make_archive(str(zip_path.with_suffix("")), 'zip', output_dir)
 
         # Cleanup uploaded file
         file_path.unlink()
 
-        return FileResponse(zip_path, media_type="application/zip", filename=f"{file.filename}.zip")
+        return FileResponse(zip_path, media_type="application/zip", filename=f"{job_id}.zip")
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Internal Server Error: {str(e)}")
