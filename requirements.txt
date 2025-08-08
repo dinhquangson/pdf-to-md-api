@@ -1,3 +1,4 @@
+pillow
 fastapi
 marker-pdf
 pydantic
