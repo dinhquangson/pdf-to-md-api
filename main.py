@@ -450,8 +450,13 @@ async def get_result(job_id: str):
 
     task: asyncio.Task = entry.get("task")
     if not task or not task.done():
-        return {"job_id": job_id, "status": "processing"}
-
+        return JSONResponse(
+            status_code=102,
+            content={
+                "job_id": job_id,
+                "status": "processing"
+            }
+        )
     if task.cancelled():
         raise HTTPException(status_code=499, detail="Conversion cancelled")
 
