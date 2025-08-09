@@ -3,15 +3,21 @@ import json
 import shutil
 from pathlib import Path
 from typing import Optional
-from fastapi import FastAPI, UploadFile, File, HTTPException, Form
+from fastapi import FastAPI, UploadFile, File, HTTPException, Form, Depends, Security, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse
+from fastapi.security import APIKeyHeader
 from marker.config.parser import ConfigParser
 from marker.converters.pdf import PdfConverter
 from marker.models import create_model_dict
 from marker.output import text_from_rendered
 from scalar_fastapi import get_scalar_api_reference, Theme
 from PIL import Image
+from dotenv import load_dotenv
+import os
+
+# Load environment variables
+load_dotenv()
 
 # Download marker model first
 artifact_dict = create_model_dict()
@@ -45,6 +51,19 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# API Key Authentication
+API_KEY = os.getenv("API_KEY")
+api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+async def verify_api_key(api_key: str = Security(api_key_header)):
+    if not api_key or api_key != API_KEY:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or missing API key",
+            headers={"WWW-Authenticate": "X-API-Key"},
+        )
+    return api_key
+
 UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(exist_ok=True)
 
@@ -55,16 +74,16 @@ async def get_api_info():
     """
     try:
         return JSONResponse(content={
-            "title": app.title,  # type: ignore
-            "description": app.description,  # type: ignore
-            "version": app.version,  # type: ignore
-            "openapi_url": app.openapi_url,  # type: ignore
-            "openapi_tags": app.openapi_tags  # type: ignore
+            "title": app.title,
+            "description": app.description,
+            "version": app.version,
+            "openapi_url": app.openapi_url,
+            "openapi_tags": app.openapi_tags
         })
     except Exception as get_api_error:
         raise HTTPException(status_code=500, detail=f"Internal Server Error: {str(get_api_error)}")
 
-@app.post("/convert", tags=["PDF Conversion"], summary="Convert PDF and return ZIP")
+@app.post("/convert", tags=["PDF Conversion"], summary="Convert PDF and return ZIP", dependencies=[Depends(verify_api_key)])
 async def convert_pdf(
         file: UploadFile = File(...),
         output_format: str = Form("markdown"),
