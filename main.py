@@ -12,6 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse
 from fastapi.security import APIKeyHeader
 from scalar_fastapi import get_scalar_api_reference, Theme
+import hashlib
 
 # Load environment variables
 load_dotenv()
@@ -34,6 +35,16 @@ except Exception:
 # Job tracking
 # We store a dict per job: { "task": asyncio.Task, "process": multiprocessing.Process, "queue": multiprocessing.Queue }
 jobs: Dict[str, Dict[str, Any]] = {}
+
+# Map from file hash -> job_id (prevents duplicate processing of same file at the same time)
+file_jobs: dict[str, str] = {}
+
+def hash_file(file_path: Path) -> str:
+    hash_md5 = hashlib.md5()
+    with open(file_path, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            hash_md5.update(chunk)
+    return hash_md5.hexdigest()
 
 # Initialize FastAPI
 app = FastAPI(
@@ -186,26 +197,20 @@ def _worker_convert(file_path_str: str, safe_filename: str, config: dict, result
 # ------------------------------
 # Async job runner (monitors worker process)
 # ------------------------------
-async def process_pdf_job(job_id: str, file_path: Path, safe_filename: str, config: dict):
+async def process_pdf_job(job_id: str, file_path: Path, safe_filename: str, config: dict, file_hash: str):
     """
     Launch worker process to perform conversion. Monitor process so cancellation requests
     terminate the child process. Return io.BytesIO of zip on success.
     """
     ctx = get_context("spawn")
     result_queue: Queue = ctx.Queue()
-    # Create process that runs _worker_convert
     p = ctx.Process(target=_worker_convert, args=(str(file_path), safe_filename, config, result_queue))
     p.start()
 
-    # Store process + queue in jobs mapping for cancel endpoint reference
-    # job entry will be updated in caller where jobs is set; here we just monitor.
     try:
-        # Poll for completion or cancellation
         while True:
-            # If job was cancelled from parent (task.cancel called), cancel
             entry = jobs.get(job_id)
             if entry is None:
-                # No entry anymore -> treat as cancelled
                 if p.is_alive():
                     try:
                         p.terminate()
@@ -213,7 +218,6 @@ async def process_pdf_job(job_id: str, file_path: Path, safe_filename: str, conf
                         pass
                 raise asyncio.CancelledError()
 
-            # If someone called cancel, and we still have process alive -> terminate
             if entry.get("cancellation_requested"):
                 if p.is_alive():
                     p.terminate()
@@ -221,13 +225,9 @@ async def process_pdf_job(job_id: str, file_path: Path, safe_filename: str, conf
 
             if not p.is_alive():
                 break
-            # Non-busy wait
             await asyncio.sleep(0.2)
 
-        # Process finished: get result from queue (non-blocking with small timeout)
         try:
-            # There may be a small delay before an item appears; try quickly
-            # Block for a small time to get result
             result = result_queue.get(timeout=1)
         except Exception:
             result = None
@@ -246,14 +246,12 @@ async def process_pdf_job(job_id: str, file_path: Path, safe_filename: str, conf
         if not zip_path.exists():
             raise HTTPException(status_code=500, detail="Output ZIP missing after conversion.")
 
-        # Optionally cleanup output files now or leave until client downloads
-        # We'll keep the zip on disk until client downloads it to allow GET /result
-        # Store result in job entry so /result can access it later
         jobs[job_id]["zip_path"] = zip_path_str
         return zip_path_str
 
     finally:
-        # Ensure process cleaned up
+        # Clean up mapping so same file can be processed again in future
+        file_jobs.pop(file_hash, None)
         try:
             if p.is_alive():
                 p.terminate()
@@ -289,6 +287,12 @@ async def convert_pdf(
     with file_path.open("wb") as f:
         f.write(await file.read())
 
+    # Hash file to detect duplicates
+    file_hash = hash_file(file_path)
+    if file_hash in file_jobs:
+        existing_job_id = file_jobs[file_hash]
+        return {"job_id": existing_job_id, "status": "already_processing"}
+
     config = {
         "output_format": output_format,
         "force_ocr": force_ocr,
@@ -303,14 +307,11 @@ async def convert_pdf(
     }
 
     job_id = str(uuid.uuid4())
+    file_jobs[file_hash] = job_id  # Track this file's hash to prevent duplicates
 
-    # Create asyncio.Task that runs the monitor/worker wrapper
-    task = asyncio.create_task(process_pdf_job(job_id, file_path, safe_filename, config))
-
-    # Store minimal job entry (cancellation_requested flag will be checked by monitor)
+    task = asyncio.create_task(process_pdf_job(job_id, file_path, safe_filename, config, file_hash))
     jobs[job_id] = {"task": task, "cancellation_requested": False}
 
-    # Return job_id immediately so client can cancel or poll result
     return {"job_id": job_id, "status": "processing"}
 
 @app.get("/result/{job_id}", dependencies=[Depends(verify_api_key)])
@@ -335,35 +336,30 @@ async def get_result(job_id: str):
     if not zip_path.exists():
         raise HTTPException(status_code=500, detail="ZIP file missing")
 
-    # Prepare file response
     response = FileResponse(
         zip_path,
         media_type="application/zip",
         filename=f"{zip_path.stem}.zip"
     )
 
-    # Cleanup after sending
     async def cleanup():
         try:
             import shutil
-            # Remove the entire output folder for this file
             output_folder = Path("output") / zip_path.stem
+            zip_file_path = output_folder / f"{zip_path.stem}.zip"
             if output_folder.exists():
                 shutil.rmtree(output_folder, ignore_errors=True)
+                shutil.rmtree(zip_file_path, ignore_errors=True)
 
-            # Also remove uploaded PDF
             uploaded_pdf = UPLOAD_DIR / f"{zip_path.stem}.pdf"
             if uploaded_pdf.exists():
                 uploaded_pdf.unlink()
         except Exception as e:
             print(f"[CLEANUP ERROR] {e}")
 
-        # Remove from job tracking
         jobs.pop(job_id, None)
 
-    # Schedule cleanup after sending file
     asyncio.create_task(cleanup())
-
     return response
 
 @app.post("/cancel/{job_id}", tags=["Job Control"], summary="Cancel a running job", dependencies=[Depends(verify_api_key)])
