@@ -1,6 +1,7 @@
 import base64
 import json
 import shutil
+import re
 from pathlib import Path
 from typing import Optional
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form, Depends, Security, status
@@ -19,8 +20,10 @@ import os
 # Load environment variables
 load_dotenv()
 
-# Get allowed origins from environment variable
-ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "").split(",")
+# Get configuration from environment variables
+ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "http://localhost:3000").split(",")
+API_KEY = os.getenv("API_KEY")
+PORT = int(os.getenv("PORT", "8000"))  # Default to 8000 if PORT is not set
 
 # Download marker model first
 artifact_dict = create_model_dict()
@@ -48,14 +51,13 @@ app = FastAPI(
 # Add CORS middleware with dynamic origins
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS or ["*"],  # Fallback to ["*"] if ALLOWED_ORIGINS is empty
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # API Key Authentication
-API_KEY = os.getenv("API_KEY")
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
 async def verify_api_key(api_key: str = Security(api_key_header)):
@@ -69,6 +71,19 @@ async def verify_api_key(api_key: str = Security(api_key_header)):
 
 UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(exist_ok=True)
+
+# Function to normalize file names
+def sanitize_filename(filename: str) -> str:
+    """
+    Normalize a filename by replacing invalid characters and spaces with underscores.
+    Preserves the file extension.
+    """
+    base, ext = os.path.splitext(filename)
+    safe_base = re.sub(r'[^\w\-]', '_', base.strip())
+    safe_base = re.sub(r'_+', '_', safe_base)
+    if not safe_base:
+        safe_base = "unnamed"
+    return f"{safe_base}{ext}"
 
 @app.get("/", tags=["/"], summary="Get API metadata")
 async def get_api_info():
@@ -100,6 +115,10 @@ async def convert_pdf(
         llm_service: Optional[str] = Form(None),
         redo_inline_math: bool = Form(False)
 ):
+    file_path = None
+    output_dir = None
+    zip_path = None
+
     try:
         if not file.filename.endswith(".pdf"):
             raise HTTPException(status_code=400, detail="Only PDF files are supported")
@@ -119,7 +138,9 @@ async def convert_pdf(
         if use_llm and llm_service and llm_service not in valid_llm_services:
             raise HTTPException(status_code=400, detail=f"Invalid llm_service. Must be one of {valid_llm_services}")
 
-        file_path = UPLOAD_DIR / file.filename
+        # Sanitize the uploaded file name
+        safe_filename = sanitize_filename(file.filename)
+        file_path = UPLOAD_DIR / safe_filename
         with file_path.open("wb") as f:
             f.write(await file.read())
 
@@ -148,8 +169,8 @@ async def convert_pdf(
         rendered = converter(str(file_path))
         text, metadata, images = text_from_rendered(rendered)
 
-        # Create unique output folder
-        zip_file_name = file.filename.removesuffix(".pdf")
+        # Create unique output folder using sanitized name without extension
+        zip_file_name = safe_filename.removesuffix(".pdf")
         output_dir = Path("output") / zip_file_name
         output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -163,7 +184,8 @@ async def convert_pdf(
 
         # Save images safely
         for img_name, img_data in images.items():
-            img_path = output_dir / f"{img_name}.jpeg"
+            safe_img_name = sanitize_filename(img_name)
+            img_path = output_dir / f"{safe_img_name}.jpeg"
             if isinstance(img_data, Image.Image):
                 img_data.save(img_path, format="JPG")
             elif isinstance(img_data, (bytes, bytearray)):
@@ -173,18 +195,33 @@ async def convert_pdf(
                 with open(img_path, "wb") as img_file:
                     img_file.write(base64.b64decode(img_data))
             else:
-                raise TypeError(f"Unsupported image data type for {img_name}: {type(img_data)}")
+                raise TypeError(f"Unsupported image data type for {safe_img_name}: {type(img_data)}")
 
-        # Create ZIP
+        # Create ZIP using sanitized name
         zip_path = Path("output") / f"{zip_file_name}.zip"
         shutil.make_archive(str(zip_path.with_suffix("")), 'zip', output_dir)
 
-        # Cleanup uploaded file
-        file_path.unlink()
+        # Serve the ZIP file with the original filename for user-friendliness
+        response = FileResponse(zip_path, media_type="application/zip", filename=f"{file.filename.removesuffix('.pdf')}.zip")
 
-        return FileResponse(zip_path, media_type="application/zip", filename=f"{zip_file_name}.zip")
+        # Cleanup uploaded file and output
+        if file_path:
+            file_path.unlink(missing_ok=True)
+        if output_dir:
+            shutil.rmtree(output_dir, ignore_errors=True)
+        if zip_path:
+            zip_path.unlink(missing_ok=True)
+
+        return response
 
     except Exception as e:
+        # Cleanup in case of errors
+        if file_path and file_path.exists():
+            file_path.unlink(missing_ok=True)
+        if output_dir and output_dir.exists():
+            shutil.rmtree(output_dir, ignore_errors=True)
+        if zip_path and zip_path.exists():
+            zip_path.unlink(missing_ok=True)
         raise HTTPException(status_code=500, detail=f"Internal Server Error: {str(e)}")
 
 @app.get("/docs", include_in_schema=False)
