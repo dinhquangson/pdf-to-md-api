@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Optional
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form, Depends, Security, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, FileResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import APIKeyHeader
 from marker.config.parser import ConfigParser
 from marker.converters.pdf import PdfConverter
@@ -16,6 +16,7 @@ from scalar_fastapi import get_scalar_api_reference, Theme
 from PIL import Image
 from dotenv import load_dotenv
 import os
+import io
 
 # Load environment variables
 load_dotenv()
@@ -120,6 +121,7 @@ async def convert_pdf(
     zip_path = None
 
     try:
+        # Validate that the uploaded file is a PDF
         if not file.filename.endswith(".pdf"):
             raise HTTPException(status_code=400, detail="Only PDF files are supported")
 
@@ -201,18 +203,24 @@ async def convert_pdf(
         zip_path = Path("output") / f"{zip_file_name}.zip"
         shutil.make_archive(str(zip_path.with_suffix("")), 'zip', output_dir)
 
-        # Serve the ZIP file with the original filename for user-friendliness
-        response = FileResponse(zip_path, media_type="application/zip", filename=f"{file.filename.removesuffix('.pdf')}.zip")
+        # Read ZIP file into memory for StreamingResponse
+        with open(zip_path, "rb") as zip_file:
+            zip_content = zip_file.read()
 
-        # Cleanup uploaded file and output
-        if file_path:
+        # Cleanup uploaded file and output immediately
+        if file_path and file_path.exists():
             file_path.unlink(missing_ok=True)
-        if output_dir:
+        if output_dir and output_dir.exists():
             shutil.rmtree(output_dir, ignore_errors=True)
-        if zip_path:
+        if zip_path and zip_path.exists():
             zip_path.unlink(missing_ok=True)
 
-        return response
+        # Serve the ZIP file as a StreamingResponse with the original filename
+        return StreamingResponse(
+            io.BytesIO(zip_content),
+            media_type="application/zip",
+            headers={"Content-Disposition": f"attachment; filename={file.filename.removesuffix('.pdf')}.zip"}
+        )
 
     except Exception as e:
         # Cleanup in case of errors
