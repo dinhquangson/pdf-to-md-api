@@ -248,6 +248,8 @@ async def process_pdf_job(job_id: str, file_path: Path, safe_filename: str, conf
 
         # Optionally cleanup output files now or leave until client downloads
         # We'll keep the zip on disk until client downloads it to allow GET /result
+        # Store result in job entry so /result can access it later
+        jobs[job_id]["zip_path"] = zip_path_str
         return zip_path_str
 
     finally:
@@ -261,8 +263,6 @@ async def process_pdf_job(job_id: str, file_path: Path, safe_filename: str, conf
             p.join(timeout=1)
         except Exception:
             pass
-        # remove job entry (the caller will pop as well)
-        jobs.pop(job_id, None)
 
 # ------------------------------
 # API endpoints
