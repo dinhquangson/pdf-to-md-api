@@ -1,22 +1,18 @@
-import base64
-import json
-import shutil
+import asyncio
+import io
+import os
 import re
+import uuid
+from multiprocessing import get_context, Queue
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Dict, Any
+from PIL import Image
+from dotenv import load_dotenv
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form, Depends, Security, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import APIKeyHeader
-from marker.config.parser import ConfigParser
-from marker.converters.pdf import PdfConverter
-from marker.models import create_model_dict
-from marker.output import text_from_rendered
 from scalar_fastapi import get_scalar_api_reference, Theme
-from PIL import Image
-from dotenv import load_dotenv
-import os
-import io
 
 # Load environment variables
 load_dotenv()
@@ -24,10 +20,21 @@ load_dotenv()
 # Get configuration from environment variables
 ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "http://localhost:3000").split(",")
 API_KEY = os.getenv("API_KEY")
-PORT = int(os.getenv("PORT", "8000"))  # Default to 8000 if PORT is not set
+PORT = int(os.getenv("PORT", "8000"))
 
-# Download marker model first
-artifact_dict = create_model_dict()
+# Note: we import create_model_dict and other marker modules inside the worker process.
+# Download marker model on main process if you want to warm it up (optional).
+try:
+    from marker.models import create_model_dict  # type: ignore
+    # Warm-up (optional) - comment out if you want worker to handle model loading
+    artifact_dict = create_model_dict()
+except Exception:
+    # If import fails at startup we still proceed; worker will try to import/initialize.
+    artifact_dict = None  # type: ignore
+
+# Job tracking
+# We store a dict per job: { "task": asyncio.Task, "process": multiprocessing.Process, "queue": multiprocessing.Queue }
+jobs: Dict[str, Dict[str, Any]] = {}
 
 # Initialize FastAPI
 app = FastAPI(
@@ -43,13 +50,17 @@ app = FastAPI(
         {
             "name": "API Info",
             "description": "Endpoint to retrieve API metadata."
+        },
+        {
+            "name": "Job Control",
+            "description": "Endpoints for cancelling running jobs."
         }
     ],
     docs_url=None,
     redoc_url=None
 )
 
-# Add CORS middleware with dynamic origins
+# CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
@@ -60,7 +71,6 @@ app.add_middleware(
 
 # API Key Authentication
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
-
 async def verify_api_key(api_key: str = Security(api_key_header)):
     if not api_key or api_key != API_KEY:
         raise HTTPException(
@@ -73,7 +83,6 @@ async def verify_api_key(api_key: str = Security(api_key_header)):
 UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(exist_ok=True)
 
-# Function to normalize file names
 def sanitize_filename(filename: str) -> str:
     """
     Normalize a filename by replacing invalid characters and spaces with underscores.
@@ -102,7 +111,169 @@ async def get_api_info():
     except Exception as get_api_error:
         raise HTTPException(status_code=500, detail=f"Internal Server Error: {str(get_api_error)}")
 
-@app.post("/convert", tags=["PDF Conversion"], summary="Convert PDF and return ZIP", dependencies=[Depends(verify_api_key)])
+# ------------------------------
+# Worker function run in child process
+# ------------------------------
+def _worker_convert(file_path_str: str, safe_filename: str, config: dict, result_queue: Queue):
+    """
+    This function runs inside a separate process. It performs the Marker conversion
+    synchronously and puts the resulting zip path (or an error dict) into result_queue.
+    """
+    try:
+        # Imports inside worker to avoid pickling heavy objects
+        from marker.config.parser import ConfigParser  # type: ignore
+        from marker.converters.pdf import PdfConverter  # type: ignore
+        from marker.models import create_model_dict as _create_model_dict  # type: ignore
+        from marker.output import text_from_rendered  # type: ignore
+        from pathlib import Path as _Path
+        import base64 as _base64
+        import json as _json
+        import shutil as _shutil
+
+        # Recreate artifact dict inside worker (this may take time but isolates process)
+        artifact = _create_model_dict()
+
+        # Build converter and run conversion
+        cfg_parser = ConfigParser(config)
+        converter = PdfConverter(
+            config=cfg_parser.generate_config_dict(),
+            artifact_dict=artifact,
+            processor_list=cfg_parser.get_processors(),
+            renderer=cfg_parser.get_renderer(),
+            llm_service=cfg_parser.get_llm_service() if config.get("use_llm") else None
+        )
+
+        rendered = converter(str(file_path_str))
+        text, metadata, images = text_from_rendered(rendered)
+
+        zip_file_name = safe_filename.removesuffix(".pdf")
+        output_dir = _Path("output") / zip_file_name
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        text_file = output_dir / f"output.{ 'md' if config['output_format'] == 'markdown' else config['output_format'] }"
+        text_file.write_text(text, encoding="utf-8")
+
+        metadata_file = output_dir / "metadata.json"
+        metadata_file.write_text(_json.dumps(metadata, indent=2), encoding="utf-8")
+
+        for img_name, img_data in images.items():
+            safe_img_name = re.sub(r'[^\w\-]', '_', img_name)
+            safe_img_name = re.sub(r'_+', '_', safe_img_name)
+            if not safe_img_name:
+                safe_img_name = "image"
+            img_path = output_dir / f"{safe_img_name}.jpeg"
+            if isinstance(img_data, Image.Image):
+                img_data.save(img_path, format="JPG")
+            elif isinstance(img_data, (bytes, bytearray)):
+                with open(img_path, "wb") as img_file:
+                    img_file.write(img_data)
+            elif isinstance(img_data, str):
+                with open(img_path, "wb") as img_file:
+                    img_file.write(_base64.b64decode(img_data))
+
+        zip_path = _Path("output") / f"{zip_file_name}.zip"
+        # Create archive (shutil in worker)
+        _shutil.make_archive(str(zip_path.with_suffix("")), 'zip', output_dir)
+
+        # Put resulting zip path back to parent
+        result_queue.put({"zip_path": str(zip_path)})
+    except Exception as e:
+        # Put error back to parent
+        try:
+            result_queue.put({"error": str(e)})
+        except Exception:
+            pass
+
+# ------------------------------
+# Async job runner (monitors worker process)
+# ------------------------------
+async def process_pdf_job(job_id: str, file_path: Path, safe_filename: str, config: dict):
+    """
+    Launch worker process to perform conversion. Monitor process so cancellation requests
+    terminate the child process. Return io.BytesIO of zip on success.
+    """
+    ctx = get_context("spawn")
+    result_queue: Queue = ctx.Queue()
+    # Create process that runs _worker_convert
+    p = ctx.Process(target=_worker_convert, args=(str(file_path), safe_filename, config, result_queue))
+    p.start()
+
+    # Store process + queue in jobs mapping for cancel endpoint reference
+    # job entry will be updated in caller where jobs is set; here we just monitor.
+    try:
+        # Poll for completion or cancellation
+        while True:
+            # If job was cancelled from parent (task.cancel called), cancel
+            entry = jobs.get(job_id)
+            if entry is None:
+                # No entry anymore -> treat as cancelled
+                if p.is_alive():
+                    try:
+                        p.terminate()
+                    except Exception:
+                        pass
+                raise asyncio.CancelledError()
+
+            # If someone called cancel, and we still have process alive -> terminate
+            if entry.get("cancellation_requested"):
+                if p.is_alive():
+                    p.terminate()
+                raise asyncio.CancelledError()
+
+            if not p.is_alive():
+                break
+            # Non-busy wait
+            await asyncio.sleep(0.2)
+
+        # Process finished: get result from queue (non-blocking with small timeout)
+        result = None
+        try:
+            # There may be a small delay before an item appears; try quickly
+            # Block for a small time to get result
+            result = result_queue.get(timeout=1)
+        except Exception:
+            result = None
+
+        if not result:
+            raise HTTPException(status_code=500, detail="Worker finished but no result was reported.")
+
+        if "error" in result:
+            raise HTTPException(status_code=500, detail=f"Worker error: {result['error']}")
+
+        zip_path_str = result.get("zip_path")
+        if not zip_path_str:
+            raise HTTPException(status_code=500, detail="Worker did not return a valid zip path.")
+
+        zip_path = Path(zip_path_str)
+        if not zip_path.exists():
+            raise HTTPException(status_code=500, detail="Output ZIP missing after conversion.")
+
+        # Read zip bytes and return io.BytesIO
+        with open(zip_path, "rb") as f:
+            zip_bytes = f.read()
+
+        # Optionally cleanup output files now or leave until client downloads
+        # We'll keep the zip on disk until client downloads it to allow GET /result
+        return io.BytesIO(zip_bytes)
+
+    finally:
+        # Ensure process cleaned up
+        try:
+            if p.is_alive():
+                p.terminate()
+        except Exception:
+            pass
+        try:
+            p.join(timeout=1)
+        except Exception:
+            pass
+        # remove job entry (the caller will pop as well)
+        jobs.pop(job_id, None)
+
+# ------------------------------
+# API endpoints
+# ------------------------------
+@app.post("/convert", tags=["PDF Conversion"], summary="Start PDF conversion job", dependencies=[Depends(verify_api_key)])
 async def convert_pdf(
         file: UploadFile = File(...),
         output_format: str = Form("markdown"),
@@ -116,130 +287,92 @@ async def convert_pdf(
         llm_service: Optional[str] = Form(None),
         redo_inline_math: bool = Form(False)
 ):
-    file_path = None
-    output_dir = None
-    zip_path = None
+    if not file.filename.endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Only PDF files are supported")
+
+    safe_filename = sanitize_filename(file.filename)
+    file_path = UPLOAD_DIR / safe_filename
+    with file_path.open("wb") as f:
+        f.write(await file.read())
+
+    config = {
+        "output_format": output_format,
+        "force_ocr": force_ocr,
+        "strip_existing_ocr": strip_existing_ocr,
+        "disable_image_extraction": disable_image_extraction,
+        "page_range": page_range,
+        "langs": langs.split(",") if langs else None,
+        "use_llm": use_llm,
+        "block_correction_prompt": block_correction_prompt,
+        "llm_service": llm_service or "marker.services.gemini.GoogleGeminiService",
+        "redo_inline_math": redo_inline_math
+    }
+
+    job_id = str(uuid.uuid4())
+
+    # Create asyncio.Task that runs the monitor/worker wrapper
+    task = asyncio.create_task(process_pdf_job(job_id, file_path, safe_filename, config))
+
+    # Store minimal job entry (cancellation_requested flag will be checked by monitor)
+    jobs[job_id] = {"task": task, "cancellation_requested": False}
+
+    # Return job_id immediately so client can cancel or poll result
+    return {"job_id": job_id, "status": "processing"}
+
+@app.get("/result/{job_id}", tags=["Job Control"], summary="Get result of a completed job", dependencies=[Depends(verify_api_key)])
+async def get_result(job_id: str):
+    entry = jobs.get(job_id)
+    if not entry:
+        raise HTTPException(status_code=404, detail="Job not found or already completed")
+
+    task: asyncio.Task = entry.get("task")
+    if not task:
+        raise HTTPException(status_code=500, detail="Job invalid state")
+
+    if not task.done():
+        return {"job_id": job_id, "status": "processing"}
+
+    # If task raised CancelledError or finished with exception, report
+    if task.cancelled():
+        raise HTTPException(status_code=499, detail="Conversion cancelled")
+
+    exc = task.exception()
+    if exc:
+        # If exception was HTTPException, raise it; otherwise return 500
+        if isinstance(exc, HTTPException):
+            raise exc
+        raise HTTPException(status_code=500, detail=str(exc))
 
     try:
-        # Validate that the uploaded file is a PDF
-        if not file.filename.endswith(".pdf"):
-            raise HTTPException(status_code=400, detail="Only PDF files are supported")
-
-        valid_formats = ["markdown", "json", "html", "chunks"]
-        if output_format not in valid_formats:
-            raise HTTPException(status_code=400, detail=f"Invalid output_format. Must be one of {valid_formats}")
-
-        valid_llm_services = [
-            "marker.services.gemini.GoogleGeminiService",
-            "marker.services.vertex.GoogleVertexService",
-            "marker.services.ollama.OllamaService",
-            "marker.services.claude.ClaudeService",
-            "marker.services.openai.OpenAIService",
-            "marker.services.azure_openai.AzureOpenAIService"
-        ]
-        if use_llm and llm_service and llm_service not in valid_llm_services:
-            raise HTTPException(status_code=400, detail=f"Invalid llm_service. Must be one of {valid_llm_services}")
-
-        # Sanitize the uploaded file name
-        safe_filename = sanitize_filename(file.filename)
-        file_path = UPLOAD_DIR / safe_filename
-        with file_path.open("wb") as f:
-            f.write(await file.read())
-
-        config = {
-            "output_format": output_format,
-            "force_ocr": force_ocr,
-            "strip_existing_ocr": strip_existing_ocr,
-            "disable_image_extraction": disable_image_extraction,
-            "page_range": page_range,
-            "langs": langs.split(",") if langs else None,
-            "use_llm": use_llm,
-            "block_correction_prompt": block_correction_prompt,
-            "llm_service": llm_service or "marker.services.gemini.GoogleGeminiService",
-            "redo_inline_math": redo_inline_math
-        }
-        config_parser = ConfigParser(config)
-
-        converter = PdfConverter(
-            config=config_parser.generate_config_dict(),
-            artifact_dict=artifact_dict,
-            processor_list=config_parser.get_processors(),
-            renderer=config_parser.get_renderer(),
-            llm_service=config_parser.get_llm_service() if use_llm else None
-        )
-
-        rendered = converter(str(file_path))
-        text, metadata, images = text_from_rendered(rendered)
-
-        # Create unique output folder using sanitized name without extension
-        zip_file_name = safe_filename.removesuffix(".pdf")
-        output_dir = Path("output") / zip_file_name
-        output_dir.mkdir(parents=True, exist_ok=True)
-
-        # Save markdown or chosen format
-        text_file = output_dir / f"output.{ 'md' if output_format == 'markdown' else output_format }"
-        text_file.write_text(text, encoding="utf-8")
-
-        # Save metadata as JSON
-        metadata_file = output_dir / "metadata.json"
-        metadata_file.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
-
-        # Save images safely
-        for img_name, img_data in images.items():
-            safe_img_name = sanitize_filename(img_name)
-            img_path = output_dir / f"{safe_img_name}.jpeg"
-            if isinstance(img_data, Image.Image):
-                img_data.save(img_path, format="JPG")
-            elif isinstance(img_data, (bytes, bytearray)):
-                with open(img_path, "wb") as img_file:
-                    img_file.write(img_data)
-            elif isinstance(img_data, str):
-                with open(img_path, "wb") as img_file:
-                    img_file.write(base64.b64decode(img_data))
-            else:
-                raise TypeError(f"Unsupported image data type for {safe_img_name}: {type(img_data)}")
-
-        # Create ZIP using sanitized name
-        zip_path = Path("output") / f"{zip_file_name}.zip"
-        shutil.make_archive(str(zip_path.with_suffix("")), 'zip', output_dir)
-
-        # Read ZIP file into memory for StreamingResponse
-        with open(zip_path, "rb") as zip_file:
-            zip_content = zip_file.read()
-
-        # Cleanup uploaded file and output immediately
-        if file_path and file_path.exists():
-            file_path.unlink(missing_ok=True)
-        if output_dir and output_dir.exists():
-            shutil.rmtree(output_dir, ignore_errors=True)
-        if zip_path and zip_path.exists():
-            zip_path.unlink(missing_ok=True)
-
-        # Serve the ZIP file as a StreamingResponse with the original filename
+        zip_content = task.result()
+        # Return streaming bytes with filename preserved
         return StreamingResponse(
-            io.BytesIO(zip_content),
+            zip_content,
             media_type="application/zip",
-            headers={"Content-Disposition": f"attachment; filename={file.filename.removesuffix('.pdf')}.zip"}
+            headers={"Content-Disposition": f"attachment; filename={job_id}.zip"}
         )
+    finally:
+        # Cleanup entry after download
+        try:
+            jobs.pop(job_id, None)
+        except Exception:
+            pass
 
-    except HTTPException as http_exc:
-        # Re-raise HTTPExceptions (e.g., 400 for non-PDF files) without wrapping
-        if file_path and file_path.exists():
-            file_path.unlink(missing_ok=True)
-        if output_dir and output_dir.exists():
-            shutil.rmtree(output_dir, ignore_errors=True)
-        if zip_path and zip_path.exists():
-            zip_path.unlink(missing_ok=True)
-        raise http_exc
-    except Exception:
-        # Cleanup for unexpected errors and return generic 500 error
-        if file_path and file_path.exists():
-            file_path.unlink(missing_ok=True)
-        if output_dir and output_dir.exists():
-            shutil.rmtree(output_dir, ignore_errors=True)
-        if zip_path and zip_path.exists():
-            zip_path.unlink(missing_ok=True)
-        raise HTTPException(status_code=500, detail="Internal Server Error")
+@app.post("/cancel/{job_id}", tags=["Job Control"], summary="Cancel a running job", dependencies=[Depends(verify_api_key)])
+async def cancel_job(job_id: str):
+    entry = jobs.get(job_id)
+    if not entry:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    # Mark cancellation requested so monitor loop can terminate the process
+    entry["cancellation_requested"] = True
+
+    # Cancel the asyncio task (so task.cancelled() becomes True)
+    task: asyncio.Task = entry.get("task")
+    if task and not task.done():
+        task.cancel()
+
+    return {"status": "cancellation_requested", "job_id": job_id}
 
 @app.get("/docs", include_in_schema=False)
 async def scalar_html():
