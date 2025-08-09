@@ -1,5 +1,6 @@
 import asyncio
 import os
+import queue
 import re
 import uuid
 from multiprocessing import get_context, Queue
@@ -16,7 +17,6 @@ import hashlib
 import shutil
 import base64
 import json
-import multiprocessing
 
 # Load environment variables
 load_dotenv()
@@ -211,8 +211,8 @@ async def process_pdf_job(job_id: str, file_path: Path, safe_filename: str, conf
             await asyncio.sleep(0.2)
 
         try:
-            result = result_queue.get(timeout=1)
-        except multiprocessing.queues.Queue:
+            result = result_queue.get(timeout=5)
+        except queue.Empty:
             result = None
 
         if not result:
