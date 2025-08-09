@@ -109,22 +109,6 @@ def sanitize_filename(filename: str) -> str:
         safe_base = "unnamed"
     return f"{safe_base}{ext}"
 
-@app.get("/", tags=["/"], summary="Get API metadata")
-async def get_api_info():
-    """
-    Retrieve metadata about the API, including title, description, version, and tags.
-    """
-    try:
-        return JSONResponse(content={
-            "title": app.title,
-            "description": app.description,
-            "version": app.version,
-            "openapi_url": app.openapi_url,
-            "openapi_tags": app.openapi_tags
-        })
-    except (ValueError, TypeError, RuntimeError) as get_api_error:
-        raise HTTPException(status_code=500, detail=f"Internal Server Error: {str(get_api_error)}")
-
 # ------------------------------
 # Worker function run in child process
 # ------------------------------
@@ -264,7 +248,23 @@ async def process_pdf_job(job_id: str, file_path: Path, safe_filename: str, conf
 # ------------------------------
 # API endpoints
 # ------------------------------
-@app.post("/convert", tags=["PDF Conversion"], summary="Start PDF conversion job", dependencies=[Depends(verify_api_key)])
+@app.get("/", tags=["/"], summary="Get API metadata")
+async def get_api_info():
+    """
+    Retrieve metadata about the API, including title, description, version, and tags.
+    """
+    try:
+        return JSONResponse(content={
+            "title": app.title,
+            "description": app.description,
+            "version": app.version,
+            "openapi_url": app.openapi_url,
+            "openapi_tags": app.openapi_tags
+        })
+    except (ValueError, TypeError, RuntimeError) as get_api_error:
+        raise HTTPException(status_code=500, detail=f"Internal Server Error: {str(get_api_error)}")
+
+@app.post("/convert", tags=["Job Conversion Control"], summary="Start PDF conversion job", dependencies=[Depends(verify_api_key)])
 async def convert_pdf(
         file: UploadFile = File(...),
         output_format: str = Form("markdown"),
@@ -313,7 +313,7 @@ async def convert_pdf(
 
     return {"job_id": job_id, "status": "processing"}
 
-@app.get("/result/{job_id}", dependencies=[Depends(verify_api_key)])
+@app.get("/result/{job_id}", tags=["Job Conversion Control"], summary="Get the converted pdf file",  dependencies=[Depends(verify_api_key)])
 async def get_result(job_id: str):
     entry = jobs.get(job_id)
     if not entry:
@@ -368,7 +368,7 @@ async def get_result(job_id: str):
     asyncio.create_task(cleanup())
     return response
 
-@app.post("/cancel/{job_id}", tags=["Job Control"], summary="Cancel a running job", dependencies=[Depends(verify_api_key)])
+@app.post("/cancel/{job_id}", tags=["Job Conversion Control"], summary="Cancel a running job", dependencies=[Depends(verify_api_key)])
 async def cancel_job(job_id: str):
     entry = jobs.get(job_id)
     if not entry:
@@ -393,7 +393,8 @@ async def scalar_html():
         return get_scalar_api_reference(
             openapi_url=app.openapi_url,
             title=app.title,
-            theme=Theme.DEEP_SPACE
+            theme=Theme.DEEP_SPACE,
+            scalar_favicon_url="🍕"
         )
     except (ValueError, TypeError, RuntimeError) as scalar_doc_error:
         raise HTTPException(status_code=500, detail=f"Internal Server Error: {str(scalar_doc_error)}")
