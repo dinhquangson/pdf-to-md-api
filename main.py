@@ -222,15 +222,24 @@ async def convert_pdf(
             headers={"Content-Disposition": f"attachment; filename={file.filename.removesuffix('.pdf')}.zip"}
         )
 
-    except Exception as e:
-        # Cleanup in case of errors
+    except HTTPException as http_exc:
+        # Re-raise HTTPExceptions (e.g., 400 for non-PDF files) without wrapping
         if file_path and file_path.exists():
             file_path.unlink(missing_ok=True)
         if output_dir and output_dir.exists():
             shutil.rmtree(output_dir, ignore_errors=True)
         if zip_path and zip_path.exists():
             zip_path.unlink(missing_ok=True)
-        raise HTTPException(status_code=500, detail=f"Internal Server Error: {str(e)}")
+        raise http_exc
+    except Exception:
+        # Cleanup for unexpected errors and return generic 500 error
+        if file_path and file_path.exists():
+            file_path.unlink(missing_ok=True)
+        if output_dir and output_dir.exists():
+            shutil.rmtree(output_dir, ignore_errors=True)
+        if zip_path and zip_path.exists():
+            zip_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=500, detail="Internal Server Error")
 
 @app.get("/docs", include_in_schema=False)
 async def scalar_html():
