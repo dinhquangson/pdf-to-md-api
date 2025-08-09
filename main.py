@@ -225,7 +225,6 @@ async def process_pdf_job(job_id: str, file_path: Path, safe_filename: str, conf
             await asyncio.sleep(0.2)
 
         # Process finished: get result from queue (non-blocking with small timeout)
-        result = None
         try:
             # There may be a small delay before an item appears; try quickly
             # Block for a small time to get result
@@ -246,10 +245,6 @@ async def process_pdf_job(job_id: str, file_path: Path, safe_filename: str, conf
         zip_path = Path(zip_path_str)
         if not zip_path.exists():
             raise HTTPException(status_code=500, detail="Output ZIP missing after conversion.")
-
-        # Read zip bytes and return io.BytesIO
-        with open(zip_path, "rb") as f:
-            zip_bytes = f.read()
 
         # Optionally cleanup output files now or leave until client downloads
         # We'll keep the zip on disk until client downloads it to allow GET /result
