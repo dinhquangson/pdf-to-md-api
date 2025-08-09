@@ -345,14 +345,21 @@ async def get_result(job_id: str):
         try:
             import shutil
             output_folder = Path("output") / zip_path.stem
-            zip_file_path = output_folder / f"{zip_path.stem}.zip"
+            zip_file_path = Path("output") / f"{zip_path.stem}.zip"  # fixed path to point directly to the zip in output/
+
+            # Remove the extracted output folder if it exists
             if output_folder.exists():
                 shutil.rmtree(output_folder, ignore_errors=True)
-                shutil.rmtree(zip_file_path, ignore_errors=True)
 
+            # Remove the generated zip file if it exists
+            if zip_file_path.exists():
+                zip_file_path.unlink()  # unlink because it's a file, not a folder
+
+            # Remove the uploaded PDF if it exists
             uploaded_pdf = UPLOAD_DIR / f"{zip_path.stem}.pdf"
             if uploaded_pdf.exists():
                 uploaded_pdf.unlink()
+
         except (OSError, RuntimeError) as e:
             print(f"[CLEANUP ERROR] {e}")
 
