@@ -451,7 +451,7 @@ async def get_result(job_id: str):
     task: asyncio.Task = entry.get("task")
     if not task or not task.done():
         return JSONResponse(
-            status_code=102,
+            status_code=202,
             content={
                 "job_id": job_id,
                 "status": "processing"
