@@ -19,6 +19,9 @@ import os
 # Load environment variables
 load_dotenv()
 
+# Get allowed origins from environment variable
+ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "").split(",")
+
 # Download marker model first
 artifact_dict = create_model_dict()
 
@@ -42,10 +45,10 @@ app = FastAPI(
     redoc_url=None
 )
 
-# Add CORS middleware
+# Add CORS middleware with dynamic origins
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS or ["*"],  # Fallback to ["*"] if ALLOWED_ORIGINS is empty
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
