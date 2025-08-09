@@ -335,15 +335,35 @@ async def get_result(job_id: str):
     if not zip_path.exists():
         raise HTTPException(status_code=500, detail="ZIP file missing")
 
-    # Serve the file directly from disk
+    # Prepare file response
     response = FileResponse(
         zip_path,
         media_type="application/zip",
         filename=f"{zip_path.stem}.zip"
     )
 
-    # Clean up after response
-    jobs.pop(job_id, None)
+    # Cleanup after sending
+    async def cleanup():
+        try:
+            import shutil
+            # Remove the entire output folder for this file
+            output_folder = Path("output") / zip_path.stem
+            if output_folder.exists():
+                shutil.rmtree(output_folder, ignore_errors=True)
+
+            # Also remove uploaded PDF
+            uploaded_pdf = UPLOAD_DIR / f"{zip_path.stem}.pdf"
+            if uploaded_pdf.exists():
+                uploaded_pdf.unlink()
+        except Exception as e:
+            print(f"[CLEANUP ERROR] {e}")
+
+        # Remove from job tracking
+        jobs.pop(job_id, None)
+
+    # Schedule cleanup after sending file
+    asyncio.create_task(cleanup())
+
     return response
 
 @app.post("/cancel/{job_id}", tags=["Job Control"], summary="Cancel a running job", dependencies=[Depends(verify_api_key)])
