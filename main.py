@@ -1,5 +1,4 @@
 import asyncio
-import io
 import os
 import re
 import uuid
@@ -10,7 +9,7 @@ from PIL import Image
 from dotenv import load_dotenv
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form, Depends, Security, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, FileResponse
 from fastapi.security import APIKeyHeader
 from scalar_fastapi import get_scalar_api_reference, Theme
 
@@ -254,7 +253,7 @@ async def process_pdf_job(job_id: str, file_path: Path, safe_filename: str, conf
 
         # Optionally cleanup output files now or leave until client downloads
         # We'll keep the zip on disk until client downloads it to allow GET /result
-        return io.BytesIO(zip_bytes)
+        return zip_path_str
 
     finally:
         # Ensure process cleaned up
@@ -319,44 +318,38 @@ async def convert_pdf(
     # Return job_id immediately so client can cancel or poll result
     return {"job_id": job_id, "status": "processing"}
 
-@app.get("/result/{job_id}", tags=["Job Control"], summary="Get result of a completed job", dependencies=[Depends(verify_api_key)])
+@app.get("/result/{job_id}", dependencies=[Depends(verify_api_key)])
 async def get_result(job_id: str):
     entry = jobs.get(job_id)
     if not entry:
-        raise HTTPException(status_code=404, detail="Job not found or already completed")
+        raise HTTPException(status_code=404, detail="Job not found or expired")
 
     task: asyncio.Task = entry.get("task")
-    if not task:
-        raise HTTPException(status_code=500, detail="Job invalid state")
-
-    if not task.done():
+    if not task or not task.done():
         return {"job_id": job_id, "status": "processing"}
 
-    # If task raised CancelledError or finished with exception, report
     if task.cancelled():
         raise HTTPException(status_code=499, detail="Conversion cancelled")
 
     exc = task.exception()
     if exc:
-        # If exception was HTTPException, raise it; otherwise return 500
-        if isinstance(exc, HTTPException):
-            raise exc
         raise HTTPException(status_code=500, detail=str(exc))
 
-    try:
-        zip_content = task.result()
-        # Return streaming bytes with filename preserved
-        return StreamingResponse(
-            zip_content,
-            media_type="application/zip",
-            headers={"Content-Disposition": f"attachment; filename={job_id}.zip"}
-        )
-    finally:
-        # Cleanup entry after download
-        try:
-            jobs.pop(job_id, None)
-        except Exception:
-            pass
+    zip_path_str = task.result()
+    zip_path = Path(zip_path_str)
+    if not zip_path.exists():
+        raise HTTPException(status_code=500, detail="ZIP file missing")
+
+    # Serve the file directly from disk
+    response = FileResponse(
+        zip_path,
+        media_type="application/zip",
+        filename=f"{zip_path.stem}.zip"
+    )
+
+    # Clean up after response
+    jobs.pop(job_id, None)
+    return response
 
 @app.post("/cancel/{job_id}", tags=["Job Control"], summary="Cancel a running job", dependencies=[Depends(verify_api_key)])
 async def cancel_job(job_id: str):
