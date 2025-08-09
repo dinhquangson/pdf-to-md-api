@@ -22,7 +22,7 @@ import multiprocessing
 load_dotenv()
 
 # Get configuration from environment variables
-ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "http://localhost:3000").split(",")
+ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "http://localhost:8000").split(",")
 API_KEY = os.getenv("API_KEY")
 PORT = int(os.getenv("PORT", "8000"))
 
@@ -63,7 +63,7 @@ app = FastAPI(
         },
         {
             "name": "API Info",
-            "description": "Endpoint to retrieve API metadata."
+            "description": "Endpoints to retrieve API metadata and supported model information."
         },
         {
             "name": "Job Control",
@@ -246,9 +246,42 @@ async def process_pdf_job(job_id: str, file_path: Path, safe_filename: str, conf
             pass
 
 # ------------------------------
-# API endpoints
+# API Endpoints
 # ------------------------------
-@app.get("/", tags=["/"], summary="Get API metadata")
+@app.get(
+    "/",
+    tags=["API Info"],
+    summary="Retrieve API metadata",
+    description="Returns metadata about the API, including title, description, version, and available tags.",
+    responses={
+        200: {
+            "description": "Successful response with API metadata",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "title": "PDF to Markdown/JSON Converter",
+                        "description": "API to convert PDF files to various formats using datalab-to/marker (LLM optional)",
+                        "version": "1.0.0",
+                        "openapi_url": "/openapi.json",
+                        "openapi_tags": [
+                            {"name": "PDF Conversion", "description": "Endpoints for converting PDF files."},
+                            {"name": "API Info", "description": "Endpoints for API metadata and model information."},
+                            {"name": "Job Control", "description": "Endpoints for cancelling jobs."}
+                        ]
+                    }
+                }
+            }
+        },
+        500: {
+            "description": "Internal server error",
+            "content": {
+                "application/json": {
+                    "example": {"detail": "Internal Server Error: [error message]"}
+                }
+            }
+        }
+    }
+)
 async def get_api_info():
     """
     Retrieve metadata about the API, including title, description, version, and tags.
@@ -264,7 +297,47 @@ async def get_api_info():
     except (ValueError, TypeError, RuntimeError) as get_api_error:
         raise HTTPException(status_code=500, detail=f"Internal Server Error: {str(get_api_error)}")
 
-@app.post("/convert", tags=["Job Conversion Control"], summary="Start PDF conversion job", dependencies=[Depends(verify_api_key)])
+@app.post(
+    "/convert",
+    tags=["PDF Conversion"],
+    summary="Start a PDF conversion job",
+    description="Uploads a PDF file and initiates an asynchronous conversion job to convert it to the specified format (Markdown, JSON, HTML, or Chunks). Returns a job ID to track the conversion status.",
+    dependencies=[Depends(verify_api_key)],
+    responses={
+        201: {
+            "description": "Job successfully started",
+            "content": {
+                "application/json": {
+                    "example": {"job_id": "123e4567-e89b-12d3-a456-426614174000", "status": "processing"}
+                }
+            }
+        },
+        400: {
+            "description": "Invalid file format (non-PDF file uploaded)",
+            "content": {
+                "application/json": {
+                    "example": {"detail": "Only PDF files are supported"}
+                }
+            }
+        },
+        401: {
+            "description": "Invalid or missing API key",
+            "content": {
+                "application/json": {
+                    "example": {"detail": "Invalid or missing API key"}
+                }
+            }
+        },
+        409: {
+            "description": "File is already being processed",
+            "content": {
+                "application/json": {
+                    "example": {"job_id": "existing-job-id", "status": "already_processing"}
+                }
+            }
+        }
+    }
+)
 async def convert_pdf(
         file: UploadFile = File(...),
         output_format: str = Form("markdown"),
@@ -313,7 +386,63 @@ async def convert_pdf(
 
     return {"job_id": job_id, "status": "processing"}
 
-@app.get("/result/{job_id}", tags=["Job Conversion Control"], summary="Get the converted pdf file",  dependencies=[Depends(verify_api_key)])
+@app.get(
+    "/result/{job_id}",
+    tags=["PDF Conversion"],
+    summary="Retrieve conversion job result",
+    description="Fetches the result of a completed PDF conversion job as a ZIP file containing the converted output, metadata, and images (if applicable).",
+    dependencies=[Depends(verify_api_key)],
+    responses={
+        200: {
+            "description": "Successful response with the converted ZIP file",
+            "content": {
+                "application/zip": {
+                    "example": "Binary ZIP file containing output.md/json/html, metadata.json, and images"
+                }
+            }
+        },
+        202: {
+            "description": "Job is still processing",
+            "content": {
+                "application/json": {
+                    "example": {"job_id": "123e4567-e89b-12d3-a456-426614174000", "status": "processing"}
+                }
+            }
+        },
+        401: {
+            "description": "Invalid or missing API key",
+            "content": {
+                "application/json": {
+                    "example": {"detail": "Invalid or missing API key"}
+                }
+            }
+        },
+        404: {
+            "description": "Job not found or expired",
+            "content": {
+                "application/json": {
+                    "example": {"detail": "Job not found or expired"}
+                }
+            }
+        },
+        499: {
+            "description": "Job was cancelled",
+            "content": {
+                "application/json": {
+                    "example": {"detail": "Conversion cancelled"}
+                }
+            }
+        },
+        500: {
+            "description": "Internal server error or missing ZIP file",
+            "content": {
+                "application/json": {
+                    "example": {"detail": "ZIP file missing"}
+                }
+            }
+        }
+    }
+)
 async def get_result(job_id: str):
     entry = jobs.get(job_id)
     if not entry:
@@ -368,7 +497,39 @@ async def get_result(job_id: str):
     asyncio.create_task(cleanup())
     return response
 
-@app.post("/cancel/{job_id}", tags=["Job Conversion Control"], summary="Cancel a running job", dependencies=[Depends(verify_api_key)])
+@app.post(
+    "/cancel/{job_id}",
+    tags=["Job Control"],
+    summary="Cancel a running conversion job",
+    description="Cancels a running PDF conversion job by its job ID.",
+    dependencies=[Depends(verify_api_key)],
+    responses={
+        200: {
+            "description": "Cancellation request accepted",
+            "content": {
+                "application/json": {
+                    "example": {"status": "cancellation_requested", "job_id": "123e4567-e89b-12d3-a456-426614174000"}
+                }
+            }
+        },
+        401: {
+            "description": "Invalid or missing API key",
+            "content": {
+                "application/json": {
+                    "example": {"detail": "Invalid or missing API key"}
+                }
+            }
+        },
+        404: {
+            "description": "Job not found",
+            "content": {
+                "application/json": {
+                    "example": {"detail": "Job not found"}
+                }
+            }
+        }
+    }
+)
 async def cancel_job(job_id: str):
     entry = jobs.get(job_id)
     if not entry:
@@ -384,7 +545,10 @@ async def cancel_job(job_id: str):
 
     return {"status": "cancellation_requested", "job_id": job_id}
 
-@app.get("/docs", include_in_schema=False)
+@app.get(
+    "/docs",
+    include_in_schema=False
+)
 async def scalar_html():
     """
     Serve Scalar documentation.
