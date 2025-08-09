@@ -152,7 +152,9 @@ def _worker_convert(file_path_str: str, safe_filename: str, config: dict, result
         metadata_file.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
 
         for img_name, img_data in images.items():
-            safe_img_name = re.sub(r'[^\w\-]', '_', img_name)
+            # Strip extension if present before sanitizing
+            base_name, _ = os.path.splitext(img_name)
+            safe_img_name = re.sub(r'[^\w\-]', '_', base_name)
             safe_img_name = re.sub(r'_+', '_', safe_img_name)
             if not safe_img_name:
                 safe_img_name = "image"
