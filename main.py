@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Optional, Dict, Any
 from PIL import Image
 from dotenv import load_dotenv
-from fastapi import FastAPI, UploadFile, File, HTTPException, Form, Depends, Security, status
+from fastapi import FastAPI, UploadFile, File, HTTPException, Form, Depends, Security, status, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse
 from fastapi.security import APIKeyHeader
@@ -443,15 +443,20 @@ async def convert_pdf(
         }
     }
 )
-async def get_result(job_id: str):
+async def get_result(job_id: str, background_tasks: BackgroundTasks):
     entry = jobs.get(job_id)
     if not entry:
         raise HTTPException(status_code=404, detail="Job not found or expired")
 
     task: asyncio.Task = entry.get("task")
     if not task or not task.done():
-        return {"job_id": job_id, "status": "processing"}
-
+        return JSONResponse(
+            status_code=202,
+            content={
+                "job_id": job_id,
+                "status": "processing"
+            }
+        )
     if task.cancelled():
         raise HTTPException(status_code=499, detail="Conversion cancelled")
 
@@ -463,12 +468,6 @@ async def get_result(job_id: str):
     zip_path = Path(zip_path_str)
     if not zip_path.exists():
         raise HTTPException(status_code=500, detail="ZIP file missing")
-
-    response = FileResponse(
-        zip_path,
-        media_type="application/zip",
-        filename=f"{zip_path.stem}.zip"
-    )
 
     async def cleanup():
         try:
@@ -494,8 +493,13 @@ async def get_result(job_id: str):
 
         jobs.pop(job_id, None)
 
-    asyncio.create_task(cleanup())
-    return response
+    background_tasks.add_task(cleanup)
+
+    return FileResponse(
+        zip_path,
+        media_type="application/zip",
+        filename=f"{zip_path.stem}.zip"
+    )
 
 @app.post(
     "/cancel/{job_id}",
