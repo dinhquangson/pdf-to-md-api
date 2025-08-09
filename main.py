@@ -13,6 +13,10 @@ from fastapi.responses import JSONResponse, FileResponse
 from fastapi.security import APIKeyHeader
 from scalar_fastapi import get_scalar_api_reference, Theme
 import hashlib
+import shutil
+import base64
+import json
+import multiprocessing
 
 # Load environment variables
 load_dotenv()
@@ -28,7 +32,7 @@ try:
     from marker.models import create_model_dict  # type: ignore
     # Warm-up (optional) - comment out if you want worker to handle model loading
     artifact_dict = create_model_dict()
-except Exception:
+except (ImportError, RuntimeError, OSError):
     # If import fails at startup we still proceed; worker will try to import/initialize.
     artifact_dict = None  # type: ignore
 
@@ -118,7 +122,7 @@ async def get_api_info():
             "openapi_url": app.openapi_url,
             "openapi_tags": app.openapi_tags
         })
-    except Exception as get_api_error:
+    except (ValueError, TypeError, RuntimeError) as get_api_error:
         raise HTTPException(status_code=500, detail=f"Internal Server Error: {str(get_api_error)}")
 
 # ------------------------------
@@ -136,9 +140,6 @@ def _worker_convert(file_path_str: str, safe_filename: str, config: dict, result
         from marker.models import create_model_dict as _create_model_dict  # type: ignore
         from marker.output import text_from_rendered  # type: ignore
         from pathlib import Path as _Path
-        import base64 as _base64
-        import json as _json
-        import shutil as _shutil
 
         # Recreate artifact dict inside worker (this may take time but isolates process)
         artifact = _create_model_dict()
@@ -164,7 +165,7 @@ def _worker_convert(file_path_str: str, safe_filename: str, config: dict, result
         text_file.write_text(text, encoding="utf-8")
 
         metadata_file = output_dir / "metadata.json"
-        metadata_file.write_text(_json.dumps(metadata, indent=2), encoding="utf-8")
+        metadata_file.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
 
         for img_name, img_data in images.items():
             safe_img_name = re.sub(r'[^\w\-]', '_', img_name)
@@ -173,25 +174,23 @@ def _worker_convert(file_path_str: str, safe_filename: str, config: dict, result
                 safe_img_name = "image"
             img_path = output_dir / f"{safe_img_name}.jpeg"
             if isinstance(img_data, Image.Image):
-                img_data.save(img_path, format="JPG")
+                img_data.save(img_path, format="JPEG")
             elif isinstance(img_data, (bytes, bytearray)):
-                with open(img_path, "wb") as img_file:
-                    img_file.write(img_data)
+                img_path.write_bytes(img_data)
             elif isinstance(img_data, str):
-                with open(img_path, "wb") as img_file:
-                    img_file.write(_base64.b64decode(img_data))
+                img_path.write_bytes(base64.b64decode(img_data))
 
         zip_path = _Path("output") / f"{zip_file_name}.zip"
         # Create archive (shutil in worker)
-        _shutil.make_archive(str(zip_path.with_suffix("")), 'zip', output_dir)
+        shutil.make_archive(str(zip_path.with_suffix("")), 'zip', output_dir)
 
         # Put resulting zip path back to parent
         result_queue.put({"zip_path": str(zip_path)})
-    except Exception as e:
+    except (OSError, RuntimeError, ValueError) as os_err:
         # Put error back to parent
         try:
-            result_queue.put({"error": str(e)})
-        except Exception:
+            result_queue.put({"error": str(os_err)})
+        except (OSError, RuntimeError):
             pass
 
 # ------------------------------
@@ -214,7 +213,7 @@ async def process_pdf_job(job_id: str, file_path: Path, safe_filename: str, conf
                 if p.is_alive():
                     try:
                         p.terminate()
-                    except Exception:
+                    except (OSError, RuntimeError):
                         pass
                 raise asyncio.CancelledError()
 
@@ -229,7 +228,7 @@ async def process_pdf_job(job_id: str, file_path: Path, safe_filename: str, conf
 
         try:
             result = result_queue.get(timeout=1)
-        except Exception:
+        except multiprocessing.queues.Queue:
             result = None
 
         if not result:
@@ -255,11 +254,11 @@ async def process_pdf_job(job_id: str, file_path: Path, safe_filename: str, conf
         try:
             if p.is_alive():
                 p.terminate()
-        except Exception:
+        except (OSError, RuntimeError):
             pass
         try:
             p.join(timeout=1)
-        except Exception:
+        except (OSError, RuntimeError):
             pass
 
 # ------------------------------
@@ -354,7 +353,7 @@ async def get_result(job_id: str):
             uploaded_pdf = UPLOAD_DIR / f"{zip_path.stem}.pdf"
             if uploaded_pdf.exists():
                 uploaded_pdf.unlink()
-        except Exception as e:
+        except (OSError, RuntimeError) as e:
             print(f"[CLEANUP ERROR] {e}")
 
         jobs.pop(job_id, None)
@@ -389,5 +388,5 @@ async def scalar_html():
             title=app.title,
             theme=Theme.DEEP_SPACE
         )
-    except Exception as scalar_doc_error:
+    except (ValueError, TypeError, RuntimeError) as scalar_doc_error:
         raise HTTPException(status_code=500, detail=f"Internal Server Error: {str(scalar_doc_error)}")
