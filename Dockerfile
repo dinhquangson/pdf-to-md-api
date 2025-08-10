@@ -1,34 +1,35 @@
-# Use an official Python image
-FROM python:3.10-slim
+# ---- Builder Stage ----
+FROM python:3.10-slim AS builder
 
-# Set working directory
+# Install build tools and necessary system packages
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        bash \
+        build-essential && \
+    rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    bash \
-    && rm -rf /var/lib/apt/lists/*
-
-# Copy requirement files and source code
+# Copy requirements file and install dependencies in a virtual environment
 COPY requirements.txt .
+RUN python -m venv /venv && \
+    /venv/bin/pip install --upgrade pip && \
+    /venv/bin/pip install --no-cache-dir -r requirements.txt
+
+# ---- Final Stage ----
+FROM python:3.10-slim
+
+WORKDIR /app
+
+# Copy the virtual environment from the builder stage
+COPY --from=builder /venv /venv
+
+# Copy your application source code and configuration files
 COPY . .
 
-# Create and activate virtual environment
-RUN python -m venv .venv \
-    && . .venv/bin/activate \
-    && pip install --upgrade pip \
-    && pip install -r requirements.txt
+# Expose the port; fallback value is 8000 and can be overridden at runtime
+ENV PORT=8000
+EXPOSE 8000
 
-# Copy .env file
-COPY .env .
-
-# Set environment variables from .env (done at runtime, not build time)
-# This way changes to .env don't require rebuilding the image
-RUN pip install --no-cache-dir python-dotenv
-
-# Expose port from .env (default fallback to 8080)
-ARG PORT=8000
-ENV PORT=${PORT}
-EXPOSE ${PORT}
-
-# Command to run the app
-CMD ["/bin/bash", "-c", ". .venv/bin/activate && uvicorn main:app --host 0.0.0.0 --port ${PORT} --reload"]
+# Ensure the virtual environment is activated and run uvicorn
+CMD ["/venv/bin/uvicorn", "main:app", "--reload"]
