@@ -17,6 +17,7 @@ import hashlib
 import shutil
 import base64
 import json
+import datetime
 
 # Load environment variables
 load_dotenv()
@@ -340,6 +341,7 @@ async def get_api_info():
         }
     }
 )
+# Modify the convert_pdf endpoint to store additional job metadata
 async def convert_pdf(
         file: UploadFile = File(...),
         output_format: str = Form("markdown"),
@@ -384,7 +386,13 @@ async def convert_pdf(
     file_jobs[file_hash] = job_id  # Track this file's hash to prevent duplicates
 
     task = asyncio.create_task(process_pdf_job(job_id, file_path, safe_filename, config, file_hash))
-    jobs[job_id] = {"task": task, "cancellation_requested": False}
+    # Add filename and creation time to job info
+    jobs[job_id] = {
+        "task": task, 
+        "cancellation_requested": False,
+        "filename": safe_filename,
+        "created_at": datetime.datetime.now(datetime.timezone.utc)
+    }
 
     return {"job_id": job_id, "status": "processing"}
 
@@ -445,7 +453,8 @@ async def convert_pdf(
         }
     }
 )
-async def get_result(job_id: str, background_tasks: BackgroundTasks):
+# Modify the get_result endpoint to not automatically clean up files
+async def get_result(job_id: str):
     entry = jobs.get(job_id)
     if not entry:
         raise HTTPException(status_code=404, detail="Job not found or expired")
@@ -471,37 +480,15 @@ async def get_result(job_id: str, background_tasks: BackgroundTasks):
     if not zip_path.exists():
         raise HTTPException(status_code=500, detail="ZIP file missing")
 
-    async def cleanup():
-        try:
-            import shutil
-            output_folder = Path("output") / zip_path.stem
-            zip_file_path = Path("output") / f"{zip_path.stem}.zip"  # fixed path to point directly to the zip in output/
-
-            # Remove the extracted output folder if it exists
-            if output_folder.exists():
-                shutil.rmtree(output_folder, ignore_errors=True)
-
-            # Remove the generated zip file if it exists
-            if zip_file_path.exists():
-                zip_file_path.unlink()  # unlink because it's a file, not a folder
-
-            # Remove the uploaded PDF if it exists
-            uploaded_pdf = UPLOAD_DIR / f"{zip_path.stem}.pdf"
-            if uploaded_pdf.exists():
-                uploaded_pdf.unlink()
-
-        except (OSError, RuntimeError) as e:
-            print(f"[CLEANUP ERROR] {e}")
-
-        jobs.pop(job_id, None)
-
-    background_tasks.add_task(cleanup)
+    # Store the zip path in the job info for future downloads
+    jobs[job_id]["zip_path"] = zip_path_str
 
     return FileResponse(
         zip_path,
         media_type="application/zip",
         filename=f"{zip_path.stem}.zip"
     )
+
 
 @app.post(
     "/cancel/{job_id}",
@@ -550,7 +537,184 @@ async def cancel_job(job_id: str):
         task.cancel()
 
     return {"status": "cancellation_requested", "job_id": job_id}
+@app.get(
+    "/jobs",
+    tags=["Job Control"],
+    summary="List all current jobs",
+    description="Returns a list of all current jobs with their status and metadata.",
+    dependencies=[Depends(verify_api_key)],
+    responses={
+        200: {
+            "description": "Successful response with job list",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "jobs": [
+                            {
+                                "job_id": "123e4567-e89b-12d3-a456-426614174000",
+                                "status": "processing",
+                                "filename": "document.pdf",
+                                "created_at": "2023-10-01T12:00:00Z"
+                            }
+                        ]
+                    }
+                }
+            }
+        },
+        401: {
+            "description": "Invalid or missing API key",
+            "content": {
+                "application/json": {
+                    "example": {"detail": "Invalid or missing API key"}
+                }
+            }
+        }
+    }
+)
+async def list_jobs():
+    """
+    Retrieve a list of all current jobs with their status and metadata.
+    """
+    try:
+        job_list = []
+        for job_id, job_info in jobs.items():
+            job_data = {
+                "job_id": job_id,
+                "status": "processing" if not job_info.get("task").done() else 
+                         "completed" if job_info.get("zip_path") else 
+                         "error" if job_info.get("task").exception() else 
+                         "cancelled" if job_info.get("cancellation_requested") else "unknown",
+                "filename": job_info.get("filename", "unknown"),
+                "created_at": job_info.get("created_at", "").isoformat() if job_info.get("created_at") else ""
+            }
+            job_list.append(job_data)
+        
+        return JSONResponse(content={"jobs": job_list})
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error retrieving job list: {str(e)}")
 
+# Add this new endpoint after the list_jobs endpoint
+@app.get(
+    "/download/{job_id}",
+    tags=["PDF Conversion"],
+    summary="Download conversion result",
+    description="Download the ZIP file containing the conversion results for a completed job.",
+    dependencies=[Depends(verify_api_key)],
+    responses={
+        200: {
+            "description": "Successful response with ZIP file",
+            "content": {
+                "application/zip": {
+                    "example": "Binary ZIP file containing output.md/json/html, metadata.json, and images"
+                }
+            }
+        },
+        401: {
+            "description": "Invalid or missing API key",
+            "content": {
+                "application/json": {
+                    "example": {"detail": "Invalid or missing API key"}
+                }
+            }
+        },
+        404: {
+            "description": "Job not found or not completed",
+            "content": {
+                "application/json": {
+                    "example": {"detail": "Job not found or not completed"}
+                }
+            }
+        }
+    }
+)
+async def download_result(job_id: str):
+    """
+    Download the ZIP file containing the conversion results for a completed job.
+    """
+    entry = jobs.get(job_id)
+    if not entry:
+        raise HTTPException(status_code=404, detail="Job not found")
+    
+    if not entry.get("zip_path"):
+        raise HTTPException(status_code=404, detail="Job not completed yet")
+    
+    zip_path = Path(entry["zip_path"])
+    if not zip_path.exists():
+        raise HTTPException(status_code=404, detail="ZIP file not found")
+    
+    return FileResponse(
+        zip_path,
+        media_type="application/zip",
+        filename=f"{zip_path.stem}.zip"
+    )
+
+
+
+
+# Add a new endpoint to clean up job files
+@app.delete(
+    "/job/{job_id}",
+    tags=["Job Control"],
+    summary="Delete a job and its files",
+    description="Deletes a job and all associated files (uploaded PDF and output ZIP).",
+    dependencies=[Depends(verify_api_key)],
+    responses={
+        200: {
+            "description": "Job successfully deleted",
+            "content": {
+                "application/json": {
+                    "example": {"status": "deleted", "job_id": "123e4567-e89b-12d3-a456-426614174000"}
+                }
+            }
+        },
+        401: {
+            "description": "Invalid or missing API key",
+            "content": {
+                "application/json": {
+                    "example": {"detail": "Invalid or missing API key"}
+                }
+            }
+        },
+        404: {
+            "description": "Job not found",
+            "content": {
+                "application/json": {
+                    "example": {"detail": "Job not found"}
+                }
+            }
+        }
+    }
+)
+async def delete_job(job_id: str):
+    entry = jobs.get(job_id)
+    if not entry:
+        raise HTTPException(status_code=404, detail="Job not found")
+    
+    try:
+        # Clean up files
+        if "zip_path" in entry:
+            zip_path = Path(entry["zip_path"])
+            if zip_path.exists():
+                zip_path.unlink()
+            
+            # Also remove the extracted folder
+            output_folder = Path("output") / zip_path.stem
+            if output_folder.exists():
+                shutil.rmtree(output_folder, ignore_errors=True)
+        
+        # Remove the uploaded file if it exists
+        filename = entry.get("filename")
+        if filename:
+            uploaded_file = UPLOAD_DIR / filename
+            if uploaded_file.exists():
+                uploaded_file.unlink()
+        
+        # Remove the job from tracking
+        jobs.pop(job_id, None)
+        
+        return {"status": "deleted", "job_id": job_id}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error deleting job: {str(e)}")
 @app.get(
     "/docs",
     include_in_schema=False
