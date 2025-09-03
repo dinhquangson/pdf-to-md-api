@@ -20,7 +20,6 @@ RUN python -m venv .venv \
 
 # Copy .env file
 COPY .env.example .env
-COPY .env .
 # Set environment variables from .env (done at runtime, not build time)
 # This way changes to .env don't require rebuilding the image
 RUN pip install --no-cache-dir python-dotenv
