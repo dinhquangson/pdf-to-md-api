@@ -118,67 +118,145 @@ def _worker_convert(file_path_str: str, safe_filename: str, config: dict, result
     This function runs inside a separate process. It performs the Marker conversion
     synchronously and puts the resulting zip path (or an error dict) into result_queue.
     """
+    import sys
+    import psutil
+    import os
+    
     try:
+        # Monitor memory usage
+        process = psutil.Process(os.getpid())
+        initial_memory = process.memory_info().rss / 1024 / 1024  # MB
+        
+        print(f"Worker started. Initial memory usage: {initial_memory:.1f} MB", flush=True)
+        
         # Imports inside worker to avoid pickling heavy objects
-        from marker.config.parser import ConfigParser  # type: ignore
-        from marker.converters.pdf import PdfConverter  # type: ignore
-        from marker.models import create_model_dict as _create_model_dict  # type: ignore
-        from marker.output import text_from_rendered  # type: ignore
-        from pathlib import Path as _Path
+        try:
+            from marker.config.parser import ConfigParser  # type: ignore
+            from marker.converters.pdf import PdfConverter  # type: ignore
+            from marker.models import create_model_dict as _create_model_dict  # type: ignore
+            from marker.output import text_from_rendered  # type: ignore
+            from pathlib import Path as _Path
+        except ImportError as e:
+            raise RuntimeError(f"Failed to import required marker modules: {e}")
+
+        # Check if input file exists and is readable
+        file_path = _Path(file_path_str)
+        if not file_path.exists():
+            raise FileNotFoundError(f"Input PDF file not found: {file_path_str}")
+        
+        if not file_path.is_file():
+            raise ValueError(f"Input path is not a file: {file_path_str}")
+            
+        # Check PDF file size
+        file_size_mb = file_path.stat().st_size / 1024 / 1024
+        print(f"Processing PDF file: {file_size_mb:.1f} MB", flush=True)
+        
+        if file_size_mb > 100:  # Warn for large files
+            print(f"Warning: Large PDF file ({file_size_mb:.1f} MB) may require significant memory and time", flush=True)
 
         # Recreate artifact dict inside worker (this may take time but isolates process)
-        artifact = _create_model_dict()
+        try:
+            print("Loading marker models...", flush=True)
+            artifact = _create_model_dict()
+            
+            # Check memory after model loading
+            memory_after_models = process.memory_info().rss / 1024 / 1024  # MB
+            print(f"Models loaded. Memory usage: {memory_after_models:.1f} MB", flush=True)
+        except Exception as e:
+            raise RuntimeError(f"Failed to load marker models: {e}")
 
         # Build converter and run conversion
-        cfg_parser = ConfigParser(config)
-        converter = PdfConverter(
-            config=cfg_parser.generate_config_dict(),
-            artifact_dict=artifact,
-            processor_list=cfg_parser.get_processors(),
-            renderer=cfg_parser.get_renderer(),
-            llm_service=cfg_parser.get_llm_service() if config.get("use_llm") else None
-        )
+        try:
+            cfg_parser = ConfigParser(config)
+            converter = PdfConverter(
+                config=cfg_parser.generate_config_dict(),
+                artifact_dict=artifact,
+                processor_list=cfg_parser.get_processors(),
+                renderer=cfg_parser.get_renderer(),
+                llm_service=cfg_parser.get_llm_service() if config.get("use_llm") else None
+            )
+        except Exception as e:
+            raise RuntimeError(f"Failed to initialize PDF converter: {e}")
 
-        rendered = converter(str(file_path_str))
-        text, metadata, images = text_from_rendered(rendered)
+        # Process the PDF
+        try:
+            print("Starting PDF processing...", flush=True)
+            rendered = converter(str(file_path_str))
+            
+            # Check memory after processing
+            memory_after_processing = process.memory_info().rss / 1024 / 1024  # MB
+            print(f"PDF processed. Memory usage: {memory_after_processing:.1f} MB", flush=True)
+            
+            text, metadata, images = text_from_rendered(rendered)
+            print(f"Text extraction complete. Found {len(images)} images", flush=True)
+        except MemoryError:
+            raise RuntimeError(f"Out of memory while processing PDF file ({file_size_mb:.1f} MB). Try processing a smaller file or increase system memory.")
+        except Exception as e:
+            raise RuntimeError(f"Failed to process PDF file (may be corrupted or unsupported format): {e}")
 
+        # Create output directory and files
         zip_file_name = safe_filename.removesuffix(".pdf")
         output_dir = _Path("output") / zip_file_name
-        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        try:
+            output_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            raise RuntimeError(f"Failed to create output directory: {e}")
 
-        text_file = output_dir / f"output.{ 'md' if config['output_format'] == 'markdown' else config['output_format'] }"
-        text_file.write_text(text, encoding="utf-8")
+        try:
+            text_file = output_dir / f"output.{ 'md' if config['output_format'] == 'markdown' else config['output_format'] }"
+            text_file.write_text(text, encoding="utf-8")
 
-        metadata_file = output_dir / "metadata.json"
-        metadata_file.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+            metadata_file = output_dir / "metadata.json"
+            metadata_file.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+        except Exception as e:
+            raise RuntimeError(f"Failed to write text/metadata files: {e}")
 
-        for img_name, img_data in images.items():
-            # Strip extension if present before sanitizing
-            base_name, _ = os.path.splitext(img_name)
-            safe_img_name = re.sub(r'[^\w\-]', '_', base_name)
-            safe_img_name = re.sub(r'_+', '_', safe_img_name)
-            if not safe_img_name:
-                safe_img_name = "image"
-            img_path = output_dir / f"{safe_img_name}.jpeg"
-            if isinstance(img_data, Image.Image):
-                img_data.save(img_path, format="JPEG")
-            elif isinstance(img_data, (bytes, bytearray)):
-                img_path.write_bytes(img_data)
-            elif isinstance(img_data, str):
-                img_path.write_bytes(base64.b64decode(img_data))
+        # Save images
+        try:
+            for img_name, img_data in images.items():
+                # Strip extension if present before sanitizing
+                base_name, _ = os.path.splitext(img_name)
+                safe_img_name = re.sub(r'[^\w\-]', '_', base_name)
+                safe_img_name = re.sub(r'_+', '_', safe_img_name)
+                if not safe_img_name:
+                    safe_img_name = "image"
+                img_path = output_dir / f"{safe_img_name}.jpeg"
+                if isinstance(img_data, Image.Image):
+                    img_data.save(img_path, format="JPEG")
+                elif isinstance(img_data, (bytes, bytearray)):
+                    img_path.write_bytes(img_data)
+                elif isinstance(img_data, str):
+                    img_path.write_bytes(base64.b64decode(img_data))
+        except Exception as e:
+            raise RuntimeError(f"Failed to save images: {e}")
 
-        zip_path = _Path("output") / f"{zip_file_name}.zip"
-        # Create archive (shutil in worker)
-        shutil.make_archive(str(zip_path.with_suffix("")), 'zip', output_dir)
+        # Create ZIP archive
+        try:
+            zip_path = _Path("output") / f"{zip_file_name}.zip"
+            shutil.make_archive(str(zip_path.with_suffix("")), 'zip', output_dir)
+            
+            if not zip_path.exists():
+                raise RuntimeError("ZIP file was not created successfully")
+        except Exception as e:
+            raise RuntimeError(f"Failed to create ZIP archive: {e}")
 
         # Put resulting zip path back to parent
         result_queue.put({"zip_path": str(zip_path)})
-    except (OSError, RuntimeError, ValueError) as os_err:
-        # Put error back to parent
+    except Exception as e:
+        # Capture all exceptions and provide detailed error information
+        import traceback
+        error_details = {
+            "error": str(e),
+            "error_type": type(e).__name__,
+            "traceback": traceback.format_exc()
+        }
         try:
-            result_queue.put({"error": str(os_err)})
-        except (OSError, RuntimeError):
-            pass
+            result_queue.put(error_details)
+        except Exception as queue_error:
+            # If we can't put to queue, at least try to log
+            print(f"Worker error (failed to report): {e}", flush=True)
+            print(f"Queue error: {queue_error}", flush=True)
 
 # ------------------------------
 # Async job runner (monitors worker process)
@@ -213,16 +291,33 @@ async def process_pdf_job(job_id: str, file_path: Path, safe_filename: str, conf
                 break
             await asyncio.sleep(0.2)
 
+        # Wait for process to fully terminate and get exit code
+        p.join(timeout=1)
+        exit_code = p.exitcode
+
         try:
             result = result_queue.get(timeout=5)
         except queue.Empty:
             result = None
 
         if not result:
-            raise HTTPException(status_code=500, detail="Worker finished but no result was reported.")
+            if exit_code is not None and exit_code != 0:
+                raise HTTPException(
+                    status_code=500, 
+                    detail=f"Worker process failed with exit code {exit_code}. This usually indicates a crash during PDF processing. Check if the PDF file is corrupted or too large."
+                )
+            else:
+                raise HTTPException(
+                    status_code=500, 
+                    detail="Worker finished but no result was reported. The process may have been terminated unexpectedly or encountered a silent failure."
+                )
 
         if "error" in result:
-            raise HTTPException(status_code=500, detail=f"Worker error: {result['error']}")
+            error_detail = f"Worker error ({result.get('error_type', 'Unknown')}): {result['error']}"
+            if "traceback" in result:
+                # Log full traceback for debugging but provide clean error to user
+                print(f"Worker traceback:\n{result['traceback']}", flush=True)
+            raise HTTPException(status_code=500, detail=error_detail)
 
         zip_path_str = result.get("zip_path")
         if not zip_path_str:
@@ -585,6 +680,7 @@ async def list_jobs():
                          "error" if job_info.get("task").exception() else 
                          "cancelled" if job_info.get("cancellation_requested") else "unknown",
                 "filename": job_info.get("filename", "unknown"),
+                "error": str(job_info.get("task").exception()),
                 "created_at": job_info.get("created_at", "").isoformat() if job_info.get("created_at") else ""
             }
             job_list.append(job_data)
