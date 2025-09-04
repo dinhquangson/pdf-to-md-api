@@ -6,3 +6,4 @@ pydantic
 scalar_fastapi
 uvicorn
 python-multipart
+psutil
